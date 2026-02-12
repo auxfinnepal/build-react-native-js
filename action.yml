@@ -97,7 +97,7 @@ runs:
     - name: Copy config file
       if: ${{ inputs.config == 'config' }}
       shell: bash
-      run: cp src/config/BaseUrl${{ inputs.mode }}.js src/config/BaseUrl.js
+      run: cp src/config/Api/BaseUrl${{ inputs.mode }}.js src/config/Api/BaseUrl.js
 
     # ✅ Install project dependencies (fast + reproducible)
     - name: Install Dependencies
