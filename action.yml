@@ -1,0 +1,195 @@
+name: Build and Deploy ReactNative App
+branding:
+  icon: "terminal"
+  color: "orange"
+
+inputs:
+  node:
+    description: "Target node version"
+    required: true
+  java:
+    description: "Target java version"
+    required: true
+  name-increment-type:
+    description: "Name increment type"
+    required: true
+  apk-name:
+    description: "Name of the apk"
+    required: true
+  config:
+    description: "Name of the config file"
+    required: true
+    default: "env"
+  mode:
+    description: "Mode of the build"
+    required: true
+    default: "Dev"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Git
+      uses: actions/checkout@v4
+
+    # ✅ Setup Node.js and cache npm dependencies
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node }}
+        cache: 'npm'
+
+    # ✅ Cache Gradle (dependencies, wrapper, and build outputs)
+    - name: Cache Gradle
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+        restore-keys: |
+          gradle-${{ runner.os }}
+
+    - name: Cache Android Build Output
+      uses: actions/cache@v4
+      with:
+        path: |
+          android/.gradle
+          android/app/build
+        key: gradle-build-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/app/src/**') }}
+        restore-keys: gradle-build-${{ runner.os }}
+
+    # ✅ Extract package name for rename steps
+    - name: Get package name from build.gradle
+      id: get_android_package_name
+      shell: bash
+      run: |
+        GRADLE_FILE="android/app/build.gradle"
+        if [[ ! -f "$GRADLE_FILE" ]]; then
+          echo "❌ build.gradle not found"
+          exit 1
+        fi
+        PACKAGE_NAME=$(grep -oE 'applicationId[[:space:]]+"[^"]+"' "$GRADLE_FILE" | head -1 | cut -d'"' -f2)
+        echo "✅ Found package name: $PACKAGE_NAME"
+        echo "android_package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+
+    # ✅ Rename app based on build mode
+    - name: Rename React Native App (Dev)
+      if: ${{ inputs.mode == 'Dev' }}
+      shell: bash
+      run: npx react-native-rename "${{inputs.apk-name}} Dev" -b "${{steps.get_android_package_name.outputs.android_package_name}}dev"
+
+    - name: Rename React Native App (Test)
+      if: ${{ inputs.mode == 'Test' }}
+      shell: bash
+      run: npx react-native-rename "${{inputs.apk-name}} Test" -b "${{steps.get_android_package_name.outputs.android_package_name}}test"
+
+    - name: Rename React Native App (Prod)
+      if: ${{ inputs.mode == 'Prod' }}
+      shell: bash
+      run: npx react-native-rename "${{inputs.apk-name}}" -b "${{steps.get_android_package_name.outputs.android_package_name}}"
+
+    # ✅ Copy environment/config files
+    - name: Copy env file
+      if: ${{ inputs.config == 'env' }}
+      shell: bash
+      run: cp .env.${{ inputs.mode }} .env
+
+    - name: Copy config file
+      if: ${{ inputs.config == 'config' }}
+      shell: bash
+      run: cp src/config/BaseUrl${{ inputs.mode }}.js src/config/BaseUrl.js
+
+    # ✅ Install project dependencies (fast + reproducible)
+    - name: Install Dependencies
+      shell: bash
+      run: npm ci --legacy-peer-deps
+
+    # ✅ Setup Java (JDK)
+    - name: Set up JDK
+      uses: actions/setup-java@v3
+      with:
+        java-version: ${{ inputs.java }}
+        distribution: 'temurin'
+
+    # ✅ Get existing Android version
+    - name: Get Android version
+      id: old
+      uses: ltDino/android-get-version-action@v1.0
+      with:
+        gradlePath: android/app/build.gradle
+
+    - name: Show old version
+      shell: bash
+      run: |
+        echo "The versionCode was ${{ steps.old.outputs.versionCode }}"
+        echo "The versionName was ${{ steps.old.outputs.versionName }}"
+
+    # ✅ Modify versionName based on mode
+    - name: Change to Dev Version
+      if: ${{ inputs.mode == 'Dev' }}
+      shell: bash
+      run: sed -i 's/versionName "[0-9.]\+"/versionName "${{ steps.old.outputs.versionName }}-Dev"/' android/app/build.gradle
+
+    - name: Change to Test Version
+      if: ${{ inputs.mode == 'Test' }}
+      shell: bash
+      run: sed -i 's/versionName "[0-9.]\+"/versionName "${{ steps.old.outputs.versionName }}-Test"/' android/app/build.gradle
+
+    # ✅ Ensure Gradle is executable
+    - name: Grant execute permission
+      shell: bash
+      run: chmod +x android/gradlew
+
+    # ✅ Build Android release (no clean unless needed)
+    - name: Build Android Release for ${{ inputs.mode }}
+      shell: bash
+      run: |
+        cd android
+        echo "🏗️ Starting Gradle build..."
+        ./gradlew assembleRelease --parallel --max-workers=4
+
+    # ✅ Retrieve new version after build
+    - name: Get new Android version
+      id: new
+      uses: ltDino/android-get-version-action@v1.0
+      with:
+        gradlePath: android/app/build.gradle
+
+    - name: Show new version
+      shell: bash
+      run: |
+        echo "The versionCode is ${{ steps.new.outputs.versionCode }}"
+        echo "The versionName is ${{ steps.new.outputs.versionName }}"
+
+    # ✅ Upload artifact to GitHub Actions
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: "${{ inputs.apk-name }}_${{ inputs.mode }}_${{ steps.new.outputs.versionName }}.apk"
+        path: "android/app/build/outputs/apk/release/app-release.apk"
+
+    # ✅ Install MinIO client (cached)
+    - name: Cache MinIO client
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/bin/mc
+        key: minio-${{ runner.os }}
+
+    - name: Install MinIO client
+      if: ${{ !hashFiles('/usr/local/bin/mc') }}
+      shell: bash
+      run: |
+        wget https://dl.min.io/client/mc/release/linux-amd64/mc
+        chmod +x mc
+        sudo mv mc /usr/local/bin/
+
+    # ✅ Upload to MinIO
+    - name: Upload APK to MinIO
+      env:
+        MINIO_ENDPOINT: https://s3.auxfin.net
+        MINIO_ACCESS_KEY: X9wsiT3ryDjk8El9I378
+        MINIO_SECRET_KEY: NaNTXwFYmnPRf1ReZjeMscPWkto829BqrH4bWrFa
+      shell: bash
+      run: |
+        mc alias set myminio $MINIO_ENDPOINT $MINIO_ACCESS_KEY $MINIO_SECRET_KEY --api s3v4
+        mc cp android/app/build/outputs/apk/release/app-release.apk myminio/artifacts/uploads/${{ inputs.apk-name }}_${{ inputs.mode }}.apk
